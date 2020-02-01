@@ -34,10 +34,8 @@
 
 (define (make-try-racket)
   (try-racket (make-semaphore 1)
-              (http-conn-open (try-racket-host)
-                              #:ssl? (try-racket-ssl?)
-                              #:port (try-racket-port)
-                              #:auto-reconnect? #t)
+              (http-conn)
+
               #f))
 
 (define COMMON-HEADERS
@@ -47,6 +45,16 @@
 (define (try-racket-eval e [c 'not-provided])
   (match-define (and (try-racket sema conn sid) client)
     (resolve-client c))
+
+  (define (connect!)
+    (http-conn-open! conn
+                     (try-racket-host)
+                     #:ssl? (try-racket-ssl?)
+                     #:port (try-racket-port)
+                     #:auto-reconnect? #t))
+
+  (unless (http-conn-live? conn)
+    (connect!))
 
   (call-with-semaphore sema
     (lambda ()
@@ -61,26 +69,36 @@
                   (lambda (out)
                     (write e out)))))))
 
-      (match/values (http-conn-sendrecv! conn
-                                         #"/eval"
-                                         #:method #"POST"
-                                         #:headers headers
-                                         #:data data)
-        [((regexp #"^HTTP/... 200 ") headers in)
-         (define new-sid
-           (for*/first ([h (in-list headers)]
-                        [m (in-value (regexp-match #rx#"(?i:set-cookie: _sid=([^;]+))" h))]
-                        #:when m)
-             (cadr m)))
+      (let loop ([failures 0])
+        (with-handlers ([exn:fail?
+                         (lambda (the-exn)
+                           (cond
+                             [(zero? failures)
+                              (connect!)
+                              (loop (add1 failures))]
 
-         (begin0 (hash-update (read-json in) 'output base64-decode/string)
-           (set-try-racket-sid! client (or new-sid sid)))]
+                             [else
+                              (raise the-exn)]))])
+          (match/values (http-conn-sendrecv! conn
+                                             #"/eval"
+                                             #:method #"POST"
+                                             #:headers headers
+                                             #:data data)
+            [((regexp #"^HTTP/... 200 ") headers in)
+             (define new-sid
+               (for*/first ([h (in-list headers)]
+                            [m (in-value (regexp-match #rx#"(?i:set-cookie: _sid=([^;]+))" h))]
+                            #:when m)
+                 (cadr m)))
 
-        [((regexp #"^HTTP/... ([^ ]+)" (list _ code)) headers in)
-         (raise (exn:fail:try-racket "request failed"
-                                     (current-continuation-marks)
-                                     (bytes->number code)
-                                     (read-json in)))]))))
+             (begin0 (hash-update (read-json in) 'output base64-decode/string)
+               (set-try-racket-sid! client (or new-sid sid)))]
+
+            [((regexp #"^HTTP/... ([^ ]+)" (list _ code)) headers in)
+             (raise (exn:fail:try-racket "request failed"
+                                         (current-continuation-marks)
+                                         (bytes->number code)
+                                         (read-json in)))]))))))
 
 (define (resolve-client c)
   (match c
